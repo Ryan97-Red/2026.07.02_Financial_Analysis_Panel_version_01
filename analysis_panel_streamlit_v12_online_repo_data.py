@@ -10,7 +10,7 @@ import streamlit as st
 
 # ============================================================
 # Financial Analysis Panel - SOFP / SOCI Flux Analysis
-# Version 12 online repository data + smooth custom SOCI + no point-click
+# Version 13 online repository data + SOCI by PL Sort + no point-click
 # Built around Ryan's standard JE database columns:
 #   BS Sort, PL Sort, BS Section A, BS Section B,
 #   BS Report FSLI, PL Section, FSLI
@@ -139,6 +139,25 @@ def natural_sort_value(x):
         return float(x)
     except Exception:
         return str(x)
+
+
+def normalize_sort_code(value) -> str:
+    """Normalize report sort code such as 6001 or 6001.0 into a stable text key."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text == "":
+        return ""
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except Exception:
+        pass
+    # Keep non-numeric sort keys as-is, but remove a trailing .0 from Excel imports.
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
 
 
 def add_row_role(df: pd.DataFrame) -> pd.DataFrame:
@@ -598,73 +617,62 @@ def sofp_account_bridge(df: pd.DataFrame, fsli: str, date1: pd.Timestamp, date2:
 # -----------------------------
 # SOCI custom structure helpers
 # -----------------------------
+# The online/sanitized database may anonymize FSLI names.
+# Therefore, SOCI is structured and calculated by PL Sort code,
+# while the displayed line name is read dynamically from the current FSLI column.
 SOCI_STRUCTURE = [
     {
         "section": "Revenues",
-        "lines": ["Salaries & bonuses", "Subsidies", "H-Fund take"],
+        "line_sorts": ["6001", "6002", "6003"],
         "subtotal": "Total revenues",
+        "subtotal_key": "total_revenues",
     },
     {
         "section": "Costs",
-        "lines": ["Food", "Apartment rental costs", "Utilities", "Healthcare", "Haircut & Clothes"],
+        "line_sorts": ["6401", "6402", "6403", "6404", "6405", "6406"],
         "subtotal": "Total costs",
+        "subtotal_key": "total_costs",
     },
     {
         "calculation": "Gross profit/(loss)",
-        "formula": "total_revenues + total_costs",
+        "key": "gross_profit",
+        "formula_keys": ["total_revenues", "total_costs"],
     },
     {
         "section": "Expenses",
-        "lines": ["Travel & Hotel", "Social & Entertainment", "Goods & Services", "Family"],
+        "line_sorts": ["6601", "6602", "6603", "6604"],
         "subtotal": "Total expenses",
+        "subtotal_key": "total_expenses",
     },
     {
         "calculation": "Operating profit/(loss)",
-        "formula": "gross_profit + total_expenses",
+        "key": "operating_profit",
+        "formula_keys": ["gross_profit", "total_expenses"],
     },
     {
         "section": "Other income/(expenses)",
-        "lines": ["Investment income", "FinExp - general", "FinExp - exchange", "FinExp - unrealised exchange"],
+        "line_sorts": ["6701", "6702", "6703", "6704"],
         "subtotal": None,
     },
     {
         "calculation": "Net income/(loss)",
-        "formula": "operating_profit + investment_income + finexp_general + finexp_exchange + finexp_unrealised_exchange",
+        "key": "net_income",
+        "formula_keys": ["operating_profit", "6701", "6702", "6703", "6704"],
     },
     {
         "section": "Other comprehensive income/(loss)",
-        "lines": ["H-Fund keep", "Medical insurance keep"],
+        "line_sorts": ["7001", "7002"],
         "subtotal": None,
     },
     {
         "calculation": "Comprehensive income/(loss)",
-        "formula": "net_income + hfund_keep + medical_insurance_keep",
+        "key": "comprehensive_income",
+        "formula_keys": ["net_income", "7001", "7002"],
     },
     {"rate": "Gross rate", "numerator": "gross_profit", "denominator": "total_revenues"},
     {"rate": "Operating rate", "numerator": "operating_profit", "denominator": "total_revenues"},
     {"rate": "Net rate", "numerator": "net_income", "denominator": "total_revenues"},
 ]
-
-SOCI_LINE_KEY = {
-    "Salaries & bonuses": "salaries_bonuses",
-    "Subsidies": "subsidies",
-    "H-Fund take": "hfund_take",
-    "Food": "food",
-    "Apartment rental costs": "apartment_rental_costs",
-    "Utilities": "utilities",
-    "Healthcare": "healthcare",
-    "Haircut & Clothes": "haircut_clothes",
-    "Travel & Hotel": "travel_hotel",
-    "Social & Entertainment": "social_entertainment",
-    "Goods & Services": "goods_services",
-    "Family": "family",
-    "Investment income": "investment_income",
-    "FinExp - general": "finexp_general",
-    "FinExp - exchange": "finexp_exchange",
-    "FinExp - unrealised exchange": "finexp_unrealised_exchange",
-    "H-Fund keep": "hfund_keep",
-    "Medical insurance keep": "medical_insurance_keep",
-}
 
 
 def safe_divide(numerator: float, denominator: float) -> float:
@@ -690,7 +698,7 @@ def show_soci_statement_dataframe(df: pd.DataFrame):
     - Rate rows show percentages in Period 1/2 and Flux, but blank Flux %.
     - Ordinary amount rows keep the normal Flux % calculation.
     """
-    display = df.drop(columns=["__level", "__fsli", "__is_rate", "__is_section"], errors="ignore").copy()
+    display = df.drop(columns=["__level", "__fsli", "__pl_sort", "__option_label", "__is_rate", "__is_section"], errors="ignore").copy()
     if display.empty:
         st.dataframe(display, use_container_width=True, hide_index=True)
         return
@@ -732,11 +740,16 @@ def soci_base(df: pd.DataFrame) -> pd.DataFrame:
 
     base = df.copy()
     base = base[base[COL_DATE].notna()].copy()
-    base = base[clean_text_series(base[COL_PL_SECTION]).ne("")].copy()
-    base = base[clean_text_series(base[COL_FSLI]).ne("")].copy()
+    base[COL_PL_SECTION] = clean_text_series(base[COL_PL_SECTION])
+    base[COL_FSLI] = clean_text_series(base[COL_FSLI])
+    base["__pl_sort_code"] = base[COL_PL_SORT].map(normalize_sort_code)
+
+    base = base[base[COL_PL_SECTION].ne("")].copy()
+    base = base[base[COL_FSLI].ne("")].copy()
+    base = base[base["__pl_sort_code"].ne("")].copy()
 
     # Optional extra filter: if Account Property exists, keep rows marked as PL & OCI.
-    # If this column is absent or not populated consistently, PL Section + FSLI still drives the SOCI.
+    # If this column is absent or not populated consistently, PL Section + FSLI + PL Sort still drives the SOCI.
     if COL_ACCOUNT_PROPERTY in base.columns:
         prop_norm = normalize_key(base[COL_ACCOUNT_PROPERTY])
         prop_mask = prop_norm.str.contains("pl", na=False) & prop_norm.str.contains("oci", na=False)
@@ -744,6 +757,23 @@ def soci_base(df: pd.DataFrame) -> pd.DataFrame:
             base = base[prop_mask].copy()
 
     return base
+
+
+def build_pl_sort_label_map(base: pd.DataFrame) -> dict[str, str]:
+    """Map PL Sort code to the current/sanitized FSLI display name."""
+    if base.empty:
+        return {}
+    labels = (
+        base[["__pl_sort_code", COL_FSLI]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values(["__pl_sort_code", COL_FSLI])
+    )
+    mapping = {}
+    for sort_code, group in labels.groupby("__pl_sort_code", sort=False):
+        names = [str(x).strip() for x in group[COL_FSLI].tolist() if str(x).strip()]
+        mapping[str(sort_code)] = names[0] if names else str(sort_code)
+    return mapping
 
 
 @st.cache_data(show_spinner=False)
@@ -754,11 +784,10 @@ def build_soci_statement(
     p2_start: pd.Timestamp,
     p2_end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Build Ryan's custom SOCI structure.
+    """Build the custom SOCI structure by PL Sort code.
 
     Display convention: all SOCI line items use -RMB Amount.
-    This makes ordinary credit-balance income show as positive, and ordinary debit-balance
-    costs/expenses show as negative, matching the requested SOCI presentation.
+    PL Sort is used as the stable mapping key so sanitized FSLI names will not break the report.
     """
     base = soci_base(df)
     if base.empty:
@@ -768,14 +797,25 @@ def build_soci_statement(
     p2 = base[(base[COL_DATE] >= p2_start) & (base[COL_DATE] <= p2_end)]
 
     # Requested presentation amount = -RMB Amount for all SOCI rows.
-    p1_sum = -p1.groupby(COL_FSLI, dropna=False)[COL_RMB].sum()
-    p2_sum = -p2.groupby(COL_FSLI, dropna=False)[COL_RMB].sum()
+    p1_sum = -p1.groupby("__pl_sort_code", dropna=False)[COL_RMB].sum()
+    p2_sum = -p2.groupby("__pl_sort_code", dropna=False)[COL_RMB].sum()
+    label_map = build_pl_sort_label_map(base)
 
     rows = []
     values_p1: dict[str, float] = {}
     values_p2: dict[str, float] = {}
 
-    def add_row(label: str, v1: float, v2: float, level: int, fsli: str = "", is_rate: bool = False, is_section: bool = False):
+    def add_row(
+        label: str,
+        v1: float,
+        v2: float,
+        level: int,
+        pl_sort: str = "",
+        fsli: str = "",
+        is_rate: bool = False,
+        is_section: bool = False,
+    ):
+        option_label = f"{pl_sort} - {fsli}" if pl_sort and fsli else ""
         rows.append({
             "Statement of Comprehensive Income": label,
             "Period 1 Amount": v1,
@@ -784,66 +824,52 @@ def build_soci_statement(
             "Flux %": np.nan if is_rate else safe_pct(v2 - v1, v1),
             "__level": level,
             "__fsli": fsli,
+            "__pl_sort": pl_sort,
+            "__option_label": option_label,
             "__is_rate": is_rate,
             "__is_section": is_section,
         })
 
-    def get_line_values(fsli: str) -> tuple[float, float]:
-        return float(p1_sum.get(fsli, 0.0)), float(p2_sum.get(fsli, 0.0))
+    def get_line_values(pl_sort: str) -> tuple[float, float]:
+        code = normalize_sort_code(pl_sort)
+        return float(p1_sum.get(code, 0.0)), float(p2_sum.get(code, 0.0))
 
     for block in SOCI_STRUCTURE:
         if "section" in block:
             section = block["section"]
-            lines = block.get("lines", [])
+            line_sorts = block.get("line_sorts", [])
             subtotal_name = block.get("subtotal")
+            subtotal_key = block.get("subtotal_key")
 
-            add_row(section, np.nan, np.nan, level=0, fsli="", is_section=True)
+            add_row(section, np.nan, np.nan, level=0, is_section=True)
             subtotal_p1 = 0.0
             subtotal_p2 = 0.0
-            for fsli in lines:
-                v1, v2 = get_line_values(fsli)
+
+            for pl_sort in line_sorts:
+                code = normalize_sort_code(pl_sort)
+                fsli_label = label_map.get(code, code)
+                v1, v2 = get_line_values(code)
                 subtotal_p1 += v1
                 subtotal_p2 += v2
-                key = SOCI_LINE_KEY.get(fsli)
-                if key:
-                    values_p1[key] = v1
-                    values_p2[key] = v2
-                add_row("   " + fsli, v1, v2, level=1, fsli=fsli)
+                values_p1[code] = v1
+                values_p2[code] = v2
+                add_row("   " + fsli_label, v1, v2, level=1, pl_sort=code, fsli=fsli_label)
 
             if subtotal_name:
-                subtotal_key = subtotal_name.lower().replace(" ", "_")
                 values_p1[subtotal_key] = subtotal_p1
                 values_p2[subtotal_key] = subtotal_p2
-                add_row(subtotal_name, subtotal_p1, subtotal_p2, level=1, fsli="")
+                add_row(subtotal_name, subtotal_p1, subtotal_p2, level=1)
 
         elif "calculation" in block:
             name = block["calculation"]
-            if name == "Gross profit/(loss)":
-                v1 = values_p1.get("total_revenues", 0.0) + values_p1.get("total_costs", 0.0)
-                v2 = values_p2.get("total_revenues", 0.0) + values_p2.get("total_costs", 0.0)
-                values_p1["gross_profit"] = v1
-                values_p2["gross_profit"] = v2
-            elif name == "Operating profit/(loss)":
-                v1 = values_p1.get("gross_profit", 0.0) + values_p1.get("total_expenses", 0.0)
-                v2 = values_p2.get("gross_profit", 0.0) + values_p2.get("total_expenses", 0.0)
-                values_p1["operating_profit"] = v1
-                values_p2["operating_profit"] = v2
-            elif name == "Net income/(loss)":
-                keys = ["operating_profit", "investment_income", "finexp_general", "finexp_exchange", "finexp_unrealised_exchange"]
-                v1 = sum(values_p1.get(k, 0.0) for k in keys)
-                v2 = sum(values_p2.get(k, 0.0) for k in keys)
-                values_p1["net_income"] = v1
-                values_p2["net_income"] = v2
-            elif name == "Comprehensive income/(loss)":
-                keys = ["net_income", "hfund_keep", "medical_insurance_keep"]
-                v1 = sum(values_p1.get(k, 0.0) for k in keys)
-                v2 = sum(values_p2.get(k, 0.0) for k in keys)
-                values_p1["comprehensive_income"] = v1
-                values_p2["comprehensive_income"] = v2
-            else:
-                v1 = np.nan
-                v2 = np.nan
-            add_row(name, v1, v2, level=0, fsli="")
+            key = block.get("key", "")
+            formula_keys = block.get("formula_keys", [])
+            v1 = sum(values_p1.get(k, 0.0) for k in formula_keys)
+            v2 = sum(values_p2.get(k, 0.0) for k in formula_keys)
+            if key:
+                values_p1[key] = v1
+                values_p2[key] = v2
+            add_row(name, v1, v2, level=0)
 
         elif "rate" in block:
             name = block["rate"]
@@ -851,7 +877,7 @@ def build_soci_statement(
             denominator = block["denominator"]
             v1 = safe_divide(values_p1.get(numerator, np.nan), values_p1.get(denominator, np.nan))
             v2 = safe_divide(values_p2.get(numerator, np.nan), values_p2.get(denominator, np.nan))
-            add_row(name, v1, v2, level=0, fsli="", is_rate=True)
+            add_row(name, v1, v2, level=0, is_rate=True)
 
     return pd.DataFrame(rows)
 
@@ -859,16 +885,18 @@ def build_soci_statement(
 @st.cache_data(show_spinner=False)
 def soci_account_bridge(
     df: pd.DataFrame,
-    fslis: list[str],
+    pl_sorts: list[str],
     p1_start: pd.Timestamp,
     p1_end: pd.Timestamp,
     p2_start: pd.Timestamp,
     p2_end: pd.Timestamp,
 ) -> pd.DataFrame:
     base = soci_base(df)
-    if base.empty or not fslis:
+    if base.empty or not pl_sorts:
         return pd.DataFrame()
-    base = base[base[COL_FSLI].isin(fslis)].copy()
+
+    selected_codes = [normalize_sort_code(x) for x in pl_sorts if normalize_sort_code(x)]
+    base = base[base["__pl_sort_code"].isin(selected_codes)].copy()
 
     p1 = base[(base[COL_DATE] >= p1_start) & (base[COL_DATE] <= p1_end)]
     p2 = base[(base[COL_DATE] >= p2_start) & (base[COL_DATE] <= p2_end)]
@@ -1143,10 +1171,22 @@ else:
     show_soci_statement_dataframe(statement)
 
     st.subheader("Flux expansion")
-    fsli_options = statement.loc[statement["__fsli"].astype(str).ne(""), "__fsli"].drop_duplicates().tolist()
-    selected_fslis = st.multiselect("Select FSLI(s) to expand", fsli_options, default=fsli_options[:1])
+    line_options_df = (
+        statement.loc[statement["__pl_sort"].astype(str).ne(""), ["__pl_sort", "__option_label"]]
+        .drop_duplicates()
+        .copy()
+    )
+    option_labels = line_options_df["__option_label"].tolist()
+    label_to_sort = dict(zip(line_options_df["__option_label"], line_options_df["__pl_sort"]))
 
-    bridge = soci_account_bridge(df, selected_fslis, p1_start, p1_end, p2_start, p2_end)
+    selected_labels = st.multiselect(
+        "Select FSLI(s) to expand",
+        option_labels,
+        default=option_labels[:1],
+    )
+    selected_pl_sorts = [label_to_sort[label] for label in selected_labels if label in label_to_sort]
+
+    bridge = soci_account_bridge(df, selected_pl_sorts, p1_start, p1_end, p2_start, p2_end)
     if bridge.empty:
         st.info("No account movement found for the selected FSLI(s).")
     else:
@@ -1172,13 +1212,13 @@ else:
         side_choice = st.radio("Transaction side", ["Debit", "Credit", "Both"], horizontal=True, key="soci_side")
 
         p1_tx = base[
-            base[COL_FSLI].isin(selected_fslis)
+            base["__pl_sort_code"].isin(selected_pl_sorts)
             & base[COL_ACCOUNT].astype(str).isin(selected_accounts)
             & (base[COL_DATE] >= p1_start)
             & (base[COL_DATE] <= p1_end)
         ].copy()
         p2_tx = base[
-            base[COL_FSLI].isin(selected_fslis)
+            base["__pl_sort_code"].isin(selected_pl_sorts)
             & base[COL_ACCOUNT].astype(str).isin(selected_accounts)
             & (base[COL_DATE] >= p2_start)
             & (base[COL_DATE] <= p2_end)
@@ -1191,7 +1231,7 @@ else:
         p2_plot = add_period_day_no(p2_tx, p2_start, f"Period 2: {p2_start_label} to {p2_end_label}")
         plot_df = pd.concat([p1_plot, p2_plot], ignore_index=True)
 
-        hover = [c for c in ["Period", COL_DATE, COL_ACCOUNT, COL_FSLI, COL_RMB, COL_ABSTRACT, COL_DIMENSION, COL_CF_SANKEY, "__side"] if c in plot_df.columns]
+        hover = [c for c in ["Period", COL_DATE, COL_ACCOUNT, COL_PL_SORT, COL_FSLI, COL_RMB, COL_ABSTRACT, COL_DIMENSION, COL_CF_SANKEY, "__side"] if c in plot_df.columns]
         render_soci_scatter = st.toggle("Render / refresh scatter chart", value=False, key="render_soci_scatter")
         if render_soci_scatter:
             with st.expander("Transaction scatter", expanded=True):
